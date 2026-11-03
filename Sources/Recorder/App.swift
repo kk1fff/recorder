@@ -11,11 +11,42 @@ struct RecorderApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let engine = CaptureEngine()
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    private var confirming = false
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        engine.prepareModel()
+    }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if engine.recording { engine.stop { sender.reply(toApplicationShouldTerminate: true) }; return .terminateLater }
-        if engine.finishing { DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { sender.terminate(nil) }; return .terminateCancel }
+        if confirming { return .terminateCancel }
+        if engine.transcribing {
+            confirming = true
+            let alert = NSAlert()
+            alert.messageText = "Transcription is still in progress"
+            alert.informativeText = "Quit now? Your video is saved, but no subtitle file will be saved."
+            alert.addButton(withTitle: "Keep Transcribing")
+            alert.addButton(withTitle: "Quit Without Subtitles")
+            let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+                if self?.engine.transcribing == false { NSApplication.shared.abortModal() }
+            }
+            RunLoop.main.add(timer, forMode: .modalPanel)
+            let response = alert.runModal()
+            timer.invalidate()
+            alert.window.orderOut(nil)
+            confirming = false
+            if !engine.transcribing { return .terminateNow }
+            if response == .alertSecondButtonReturn { engine.cancelTranscription(); return .terminateNow }
+            return .terminateCancel
+        }
+        if engine.recording {
+            engine.stop { sender.terminate(nil) }
+            return .terminateCancel
+        }
+        if engine.finishing {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { sender.terminate(nil) }
+            return .terminateCancel
+        }
         return .terminateNow
     }
+
 }
 struct ContentView: View {
     @ObservedObject var engine: CaptureEngine
@@ -29,6 +60,34 @@ struct ContentView: View {
             if showMicReminder && engine.recording && !engine.audioEnabled {
                 microphoneReminder
             }
+            HStack {
+                Text("Destination: " + (engine.destination?.path ?? "Choose a folder"))
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer()
+                Button("Choose Folder…") {
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = true; panel.canChooseFiles = false
+                    panel.allowsMultipleSelection = false; panel.canCreateDirectories = true
+                    if panel.runModal() == .OK, let url = panel.url { engine.setDestination(url) }
+                }.disabled(engine.recording || engine.finishing)
+            }
+            if !engine.modelReady {
+                HStack {
+                    if engine.modelLoading {
+                        ProgressView(value: engine.modelProgress)
+                        Text(engine.modelProgress < 0.9 ? "Downloading transcription model…" : "Loading transcription model…")
+                    } else { Button("Retry Model Setup") { engine.prepareModel() } }
+                }
+            }
+            if engine.transcribing {
+                HStack {
+                    ProgressView(value: engine.transcriptionProgress)
+                    Text("Transcribing… \(Int(engine.transcriptionProgress * 100))%")
+                }
+            }
+            if engine.transcriptionFailed {
+                Button("Retry Transcription") { engine.transcribeLastRecording() }
+            }
             HStack(spacing: 16) {
                 preview("Camera", image: engine.cameraPreview, symbol: "video")
                 preview(engine.sourceName, image: engine.screenPreview, symbol: "display")
@@ -37,10 +96,11 @@ struct ContentView: View {
                 if engine.recording { TimelineView(.periodic(from: startedAt, by: 1)) { context in Text(Duration.seconds(Int(context.date.timeIntervalSince(startedAt))).formatted(.time(pattern: .hourMinuteSecond))).monospacedDigit() } }
                 Text(engine.status).font(.callout).foregroundStyle(.secondary)
                 Spacer()
-                if let url = engine.lastFile { Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) } }
+                if let url = engine.lastFile { Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url.deletingLastPathComponent()]) } }
             }
             Spacer(minLength: 0)
         }.padding(28)
+        .background(WindowCloseGuard())
         .onChange(of: engine.recording) { _, active in
             if active { startedAt = Date() }
             showMicReminder = active && !engine.audioEnabled
@@ -49,7 +109,7 @@ struct ContentView: View {
             if enabled { showMicReminder = false }
         }
         .toolbar {
-            Button(engine.recording ? "Stop Recording" : "Start Recording", systemImage: engine.recording ? "stop.circle.fill" : "record.circle") { if engine.recording { engine.stop() } else { engine.start() } }.disabled(engine.finishing)
+            Button(engine.recording ? "Stop Recording" : "Start Recording", systemImage: engine.recording ? "stop.circle.fill" : "record.circle") { if engine.recording { engine.stop() } else { engine.start() } }.disabled(engine.finishing || (!engine.recording && (!engine.modelReady || engine.destination == nil)))
             Button(engine.audioEnabled ? "Mute Microphone" : "Enable Microphone", systemImage: engine.audioEnabled ? "mic.fill" : "mic.slash") { changeMicrophone() }.disabled(engine.finishing || changingMicrophone)
             Button(engine.cameraEnabled ? "Disable Camera" : "Enable Camera", systemImage: engine.cameraEnabled ? "video.fill" : "video.slash") { Task { await engine.toggleCamera() } }.disabled(engine.recording || engine.finishing)
             Button(engine.screenEnabled ? "Disable Screen" : "Select Screen", systemImage: "display") {
@@ -133,5 +193,19 @@ struct SourcePicker: View {
                 }.buttonStyle(.plain) }
             } }
         }.padding(24).task { await engine.loadSources() }
+    }
+}
+
+struct WindowCloseGuard: NSViewRepresentable {
+    final class Coordinator: NSObject, NSWindowDelegate {
+        func windowShouldClose(_ sender: NSWindow) -> Bool {
+            NSApplication.shared.terminate(nil)
+            return false
+        }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ view: NSView, context: Context) {
+        DispatchQueue.main.async { view.window?.delegate = context.coordinator }
     }
 }

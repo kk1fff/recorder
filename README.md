@@ -3,13 +3,27 @@
 Native macOS 14+ screen and webcam recorder.
 
 Build with `./scripts/build.sh`, then launch `open dist/Recorder.app`.
-Requires Xcode command-line tools with Swift 5.9 or later.
+Requires Xcode command-line tools with Swift 5.10 or later (Xcode 16+ recommended).
 
 Enable a camera, a screen/window, or both. Enable the microphone to record
 voice. Select the screen resolution cap before enabling screen capture.
-Start recording; Stop saves an H.264/AAC MP4 in Documents. Closing the
-window or quitting finalizes the recording before exiting. Force Quit and
-power loss cannot guarantee a playable file.
+Choose a destination folder before recording; Recorder remembers it across launches.
+Stop saves an H.264/AAC `recording.mp4` and then generates `recording.srt`
+inside a new `recording_YYYYMMDD_HHMMSS` folder under that destination.
+Folder names use local recording start time; existing folders are never overwritten.
+
+On first launch Recorder downloads multilingual Whisper Large v3 Turbo (compressed)
+and its tokenizer into Application Support. Wait for setup before recording;
+failed setup can be retried. Later launches work offline with the cached model.
+Transcription runs locally on Apple Silicon, detects the spoken language, and
+uses microphone audio only. A progress bar shows completed audio processing.
+No speech produces an empty SRT.
+
+Closing the window or quitting during transcription asks whether to keep
+transcribing or quit without subtitles. Confirming quit preserves the finalized
+MP4 and does not save an SRT. Closing during recording finalizes the video first,
+then asks about transcription. Failed transcription can be retried in the app.
+Force Quit and power loss cannot guarantee a playable file.
 
 Screen and camera panels are adjacent, preserving proportions with black
 vertical padding. Choose webcam output of 480p (854×480) or 720p

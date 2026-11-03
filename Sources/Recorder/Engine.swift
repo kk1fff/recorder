@@ -46,6 +46,84 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     @Published var lastFile: URL?
     @Published var resolution = 1920
     @Published var webcamResolution: WebcamResolution = .p720
+    @Published var destination: URL?
+    @Published var modelReady = false
+    @Published var modelLoading = false
+    @Published var modelProgress = 0.0
+    @Published var transcribing = false
+    @Published var transcriptionProgress = 0.0
+    @Published var transcriptionFailed = false
+    private let transcriptionService = TranscriptionService()
+    private var transcriptionTask: Task<Void, Never>?
+    private var transcriptionID = UUID()
+    private var destinationScoped = false
+
+    override init() {
+        super.init()
+        if let data = UserDefaults.standard.data(forKey: "destinationBookmark") {
+            var stale = false
+            if let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &stale) {
+                setDestination(url)
+            }
+        }
+    }
+
+    func setDestination(_ url: URL) {
+        if destinationScoped, let destination { destination.stopAccessingSecurityScopedResource() }
+        destinationScoped = url.startAccessingSecurityScopedResource()
+        destination = url
+        if let data = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
+            UserDefaults.standard.set(data, forKey: "destinationBookmark")
+        }
+    }
+
+    func prepareModel() {
+        guard !modelReady, !modelLoading else { return }
+        modelLoading = true; modelProgress = 0
+        Task { @MainActor in
+            do {
+                try await transcriptionService.prepare { value in
+                    Task { @MainActor in self.modelProgress = value }
+                }
+                modelReady = true
+            } catch { self.error = "Model setup failed: \(error.localizedDescription)" }
+            modelLoading = false
+        }
+    }
+
+    func transcribeLastRecording() {
+        guard let url = lastFile, !transcribing else { return }
+        transcribing = true; finishing = true; transcriptionFailed = false
+        transcriptionProgress = 0; status = "Transcribing…"
+        let id = UUID(); transcriptionID = id
+        transcriptionTask = Task { @MainActor in
+            do {
+                let text = try await transcriptionService.transcribe(url) { value in
+                    Task { @MainActor in
+                        if self.transcriptionID == id { self.transcriptionProgress = max(self.transcriptionProgress, value) }
+                    }
+                }
+                try Task.checkCancellation()
+                guard transcriptionID == id else { return }
+                try text.write(to: url.deletingLastPathComponent().appendingPathComponent("recording.srt"), atomically: true, encoding: .utf8)
+                transcriptionProgress = 1
+                status = text.isEmpty ? "Saved. No speech detected." : "Video and subtitles saved."
+            } catch {
+                guard transcriptionID == id else { return }
+                transcriptionFailed = true
+                self.error = "Video saved; transcription failed: \(error.localizedDescription)"
+                status = "Video saved; transcription failed."
+            }
+            transcribing = false; finishing = false
+        }
+    }
+
+    func cancelTranscription() {
+        transcriptionID = UUID()
+        transcriptionTask?.cancel()
+        transcribing = false; finishing = false
+    }
+
     private let queue = DispatchQueue(label: "recorder.media")
     private let context = CIContext()
     private let cameraSession = AVCaptureSession()
@@ -180,16 +258,19 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     }
 
     func start() {
+        guard modelReady, !recording, !finishing else { return }
+        guard let destination, FileManager.default.isWritableFile(atPath: destination.path) else {
+            error = "Choose an available, writable destination folder."; return
+        }
+        var createdFolder: URL?
         let webcamSize = webcamResolution.size
         do {
             try queue.sync {
                 guard useScreen || useCamera else { throw RecorderError.message("Enable a screen or camera before recording.") }
                 guard !useScreen || screenImage != nil, !useCamera || cameraImage != nil else { throw RecorderError.message("Waiting for the first preview frame. Try again in a moment.") }
-                let folder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                let formatter = DateFormatter(); formatter.dateFormat = "yyyyMMdd_HHmmss"; formatter.locale = Locale(identifier: "en_US_POSIX")
-                let url = folder.appendingPathComponent("recording_\(formatter.string(from: Date())).mp4")
-                guard !FileManager.default.fileExists(atPath: url.path) else { throw RecorderError.message("A recording with this timestamp already exists. Please try again.") }
+                let folder = try RecordingOutput.createFolder(in: destination, at: Date())
+                createdFolder = folder
+                let url = folder.appendingPathComponent("recording.mp4")
                 leftSize = useScreen ? screenSize : .zero
                 rightSize = useCamera ? webcamSize : .zero
                 outputSize = CGSize(width: leftSize.width + rightSize.width, height: max(leftSize.height, rightSize.height))
@@ -215,8 +296,11 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
                 timer.setEventHandler { [weak self] in self?.writeFrame() }
                 self.timer = timer; timer.resume()
             }
-            recording = true; lastFile = nil; status = "Recording to Documents…"
-        } catch { self.error = error.localizedDescription }
+            recording = true; lastFile = nil; transcriptionFailed = false; status = "Recording…"
+        } catch {
+            if let createdFolder { try? FileManager.default.removeItem(at: createdFolder) }
+            self.error = error.localizedDescription
+        }
     }
 
     private func fitted(_ image: CIImage, in rect: CGRect) -> CIImage {
@@ -257,7 +341,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
             asset.finishWriting {
                 DispatchQueue.main.async {
                     self.finishing = false
-                    if asset.status == .completed { self.lastFile = url; self.status = "Saved \(url?.lastPathComponent ?? "recording")" }
+                    if asset.status == .completed { self.lastFile = url; self.transcribeLastRecording() }
                     else { self.error = asset.error?.localizedDescription ?? "Unable to finish the recording."; self.status = "Recording failed." }
                     completion?()
                 }

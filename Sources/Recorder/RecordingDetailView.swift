@@ -3,6 +3,29 @@ import AVKit
 import AppKit
 import UniformTypeIdentifiers
 
+/// Use AppKit directly to avoid the _AVKit_SwiftUI superclass-metadata crash
+/// when SwiftUI's VideoPlayer is first instantiated on affected macOS releases.
+struct RecordingPlayerView: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.controlsStyle = .inline
+        view.videoGravity = .resizeAspect
+        view.player = player
+        return view
+    }
+
+    func updateNSView(_ view: AVPlayerView, context: Context) {
+        if view.player !== player { view.player = player }
+    }
+
+    static func dismantleNSView(_ view: AVPlayerView, coordinator: ()) {
+        view.player?.pause()
+        view.player = nil
+    }
+}
+
 final class RecordingPlayback: ObservableObject {
     let player: AVPlayer
     @Published var position = 0.0
@@ -76,7 +99,7 @@ struct RecordingDetailView: View {
             Divider()
             HStack(alignment: .top, spacing: 0) {
                 VStack(alignment: .leading, spacing: 20) {
-                    VideoPlayer(player: playback.player)
+                    RecordingPlayerView(player: playback.player)
                         .aspectRatio(16 / 10, contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                         .accessibilityLabel("Recorded video player")

@@ -4,17 +4,23 @@ import ScreenCaptureKit
 import CoreImage
 
 enum WebcamResolution: String, CaseIterable, Identifiable {
-    case p480, p720
+    case auto, p480, p720
 
     var id: String { rawValue }
     var label: String {
         switch self {
+        case .auto: return "Auto (10% of video width)"
         case .p480: return "480p (854×480)"
         case .p720: return "720p (1280×720)"
         }
     }
-    var size: CGSize {
+    func size(screenSize: CGSize?) -> CGSize {
         switch self {
+        case .auto:
+            guard let screenSize else { return CGSize(width: 1280, height: 720) }
+            let width = max(2, (screenSize.width / 9 / 2).rounded() * 2)
+            let height = max(2, (width * 9 / 16 / 2).rounded() * 2)
+            return CGSize(width: width, height: height)
         case .p480: return CGSize(width: 854, height: 480)
         case .p720: return CGSize(width: 1280, height: 720)
         }
@@ -33,6 +39,7 @@ struct CaptureSource: Identifiable {
 final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     @Published var cameraPreview: NSImage?
     @Published var screenPreview: NSImage?
+    @Published private(set) var selectedScreenSize = CGSize(width: 1920, height: 1080)
     @Published var cameraEnabled = false
     @Published var screenEnabled = false
     @Published var audioEnabled = false
@@ -45,7 +52,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     @Published var error: String?
     @Published var lastFile: URL?
     @Published var resolution = 1920
-    @Published var webcamResolution: WebcamResolution = .p720
+    @Published var webcamResolution: WebcamResolution = .auto
     @Published var destination: URL?
     @Published var modelReady = false
     @Published var modelLoading = false
@@ -53,14 +60,30 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     @Published var transcribing = false
     @Published var transcriptionProgress = 0.0
     @Published var transcriptionFailed = false
+    @Published var transcriptionEnabled: Bool {
+        didSet {
+            preferences.set(transcriptionEnabled, forKey: "transcriptionEnabled")
+            if transcriptionEnabled { prepareModel() }
+        }
+    }
+    @Published private(set) var lastRecordingNeedsTranscript = false
+    @Published private(set) var subtitles: [Subtitle] = []
+    @Published private(set) var transcriptReady = false
     private let transcriptionService = TranscriptionService()
     private var transcriptionTask: Task<Void, Never>?
     private var transcriptionID = UUID()
     private var destinationScoped = false
+    private let preferences: UserDefaults
 
-    override init() {
+    override convenience init() {
+        self.init(preferences: .standard)
+    }
+
+    init(preferences: UserDefaults) {
+        self.preferences = preferences
+        self.transcriptionEnabled = preferences.object(forKey: "transcriptionEnabled") as? Bool ?? true
         super.init()
-        if let data = UserDefaults.standard.data(forKey: "destinationBookmark") {
+        if let data = preferences.data(forKey: "destinationBookmark") {
             var stale = false
             if let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &stale) {
                 setDestination(url)
@@ -73,7 +96,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
         destinationScoped = url.startAccessingSecurityScopedResource()
         destination = url
         if let data = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
-            UserDefaults.standard.set(data, forKey: "destinationBookmark")
+            preferences.set(data, forKey: "destinationBookmark")
         }
     }
 
@@ -98,16 +121,18 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
         let id = UUID(); transcriptionID = id
         transcriptionTask = Task { @MainActor in
             do {
-                let text = try await transcriptionService.transcribe(url) { value in
+                let cues = try await transcriptionService.transcribe(url) { value in
                     Task { @MainActor in
                         if self.transcriptionID == id { self.transcriptionProgress = max(self.transcriptionProgress, value) }
                     }
                 }
                 try Task.checkCancellation()
                 guard transcriptionID == id else { return }
-                try text.write(to: url.deletingLastPathComponent().appendingPathComponent("recording.srt"), atomically: true, encoding: .utf8)
+                try RecordingOutput.srt(cues).write(to: url.deletingLastPathComponent().appendingPathComponent("recording.srt"), atomically: true, encoding: .utf8)
+                subtitles = cues
+                transcriptReady = true
                 transcriptionProgress = 1
-                status = text.isEmpty ? "Saved. No speech detected." : "Video and subtitles saved."
+                status = cues.isEmpty ? "Saved. No speech detected." : "Video and subtitles saved."
             } catch {
                 guard transcriptionID == id else { return }
                 transcriptionFailed = true
@@ -122,6 +147,19 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
         transcriptionID = UUID()
         transcriptionTask?.cancel()
         transcribing = false; finishing = false
+    }
+
+    @discardableResult
+    func saveTranscript(_ cues: [Subtitle]) -> Bool {
+        guard let lastFile, transcriptReady, !transcribing else { return false }
+        do {
+            try RecordingOutput.srt(cues).write(to: lastFile.deletingPathExtension().appendingPathExtension("srt"), atomically: true, encoding: .utf8)
+            subtitles = cues
+            return true
+        } catch {
+            self.error = "Could not save transcript edits: \(error.localizedDescription)"
+            return false
+        }
     }
 
     private let queue = DispatchQueue(label: "recorder.media")
@@ -191,8 +229,9 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
             queue.sync { self.screenImage = nil; self.screenSize = size; self.useScreen = true }
             stream = next
             try await next.startCapture()
+            selectedScreenSize = size
             screenEnabled = true; sourceName = source.name
-            status = "Ready to record."
+            status = "Screen selected."
         } catch { queue.sync { self.useScreen = false }; screenEnabled = false; self.error = error.localizedDescription }
     }
 
@@ -229,7 +268,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
                 }
                 cameraSession.startRunning(); useCamera = true
             }
-            cameraEnabled = true; status = "Ready to record."
+            cameraEnabled = true; status = "Camera enabled."
         } catch { self.error = error.localizedDescription }
     }
 
@@ -258,12 +297,12 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     }
 
     func start() {
-        guard modelReady, !recording, !finishing else { return }
+        guard (!transcriptionEnabled || modelReady), !recording, !finishing else { return }
         guard let destination, FileManager.default.isWritableFile(atPath: destination.path) else {
             error = "Choose an available, writable destination folder."; return
         }
         var createdFolder: URL?
-        let webcamSize = webcamResolution.size
+        let selectedWebcamResolution = webcamResolution
         do {
             try queue.sync {
                 guard useScreen || useCamera else { throw RecorderError.message("Enable a screen or camera before recording.") }
@@ -272,7 +311,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
                 createdFolder = folder
                 let url = folder.appendingPathComponent("recording.mp4")
                 leftSize = useScreen ? screenSize : .zero
-                rightSize = useCamera ? webcamSize : .zero
+                rightSize = useCamera ? selectedWebcamResolution.size(screenSize: useScreen ? screenSize : nil) : .zero
                 outputSize = CGSize(width: leftSize.width + rightSize.width, height: max(leftSize.height, rightSize.height))
                 let asset = try AVAssetWriter(outputURL: url, fileType: .mp4)
                 let video = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: Int(outputSize.width), AVVideoHeightKey: Int(outputSize.height), AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 14_000_000, AVVideoExpectedSourceFrameRateKey: 30]])
@@ -296,6 +335,8 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
                 timer.setEventHandler { [weak self] in self?.writeFrame() }
                 self.timer = timer; timer.resume()
             }
+            lastRecordingNeedsTranscript = transcriptionEnabled
+            subtitles = []; transcriptReady = false
             recording = true; lastFile = nil; transcriptionFailed = false; status = "Recording…"
         } catch {
             if let createdFolder { try? FileManager.default.removeItem(at: createdFolder) }
@@ -341,7 +382,11 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
             asset.finishWriting {
                 DispatchQueue.main.async {
                     self.finishing = false
-                    if asset.status == .completed { self.lastFile = url; self.transcribeLastRecording() }
+                    if asset.status == .completed {
+                        self.lastFile = url
+                        if self.lastRecordingNeedsTranscript { self.transcribeLastRecording() }
+                        else { self.status = "Video saved." }
+                    }
                     else { self.error = asset.error?.localizedDescription ?? "Unable to finish the recording."; self.status = "Recording failed." }
                     completion?()
                 }

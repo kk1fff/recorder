@@ -3,13 +3,23 @@ import AVFoundation
 import WhisperKit
 import Darwin
 
-struct Subtitle {
+struct Subtitle: Equatable {
     let start: Double
     let end: Double
-    let text: String
+    var text: String
 }
 
 enum RecordingOutput {
+    static func timestamp(_ seconds: Double) -> String {
+        let value = seconds.isFinite ? Int(max(0, seconds)) : 0
+        return value >= 3600 ? String(format: "%d:%02d:%02d", value / 3600, value / 60 % 60, value % 60) : String(format: "%d:%02d", value / 60, value % 60)
+    }
+
+    static func transcript(_ cues: [Subtitle]) -> String {
+        cues.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.end > $0.start }
+            .map { "\(timestamp($0.start))  \($0.text.trimmingCharacters(in: .whitespacesAndNewlines))" }
+            .joined(separator: "\n\n")
+    }
     static func folderName(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -52,11 +62,11 @@ actor TranscriptionService {
         progress(1)
     }
 
-    func transcribe(_ url: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> String {
+    func transcribe(_ url: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> [Subtitle] {
         guard let pipe else { throw RecorderError.message("Transcription model is not ready.") }
         let asset = AVURLAsset(url: url)
         let duration = try await asset.load(.duration).seconds
-        guard duration.isFinite, duration > 0, let track = try await asset.loadTracks(withMediaType: .audio).first else { return "" }
+        guard duration.isFinite, duration > 0, let track = try await asset.loadTracks(withMediaType: .audio).first else { return [] }
         // Read bounded windows on the movie timeline, preserving delayed microphone starts and mute gaps.
         var cues: [Subtitle] = []
         var offset = 0.0
@@ -97,6 +107,6 @@ actor TranscriptionService {
             progress(min(0.99, offset / duration))
         }
         try Task.checkCancellation()
-        return RecordingOutput.srt(cues)
+        return cues.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.end > $0.start }
     }
 }

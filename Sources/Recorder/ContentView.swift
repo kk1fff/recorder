@@ -12,12 +12,21 @@ enum RecorderStyle {
 /// Draw the thumb explicitly: the small macOS switch can lose it in its enabled state.
 struct SourceToggleStyle: ToggleStyle {
     @Environment(\.isEnabled) private var isEnabled
+    var microphoneActivity: Double? = nil
+    var showsMicrophoneActivity = false
 
     func makeBody(configuration: Configuration) -> some View {
         Button { configuration.isOn.toggle() } label: {
             HStack {
                 configuration.label
-                Spacer()
+                Spacer(minLength: microphoneActivity == nil ? nil : 42)
+                    .overlay(alignment: .trailing) {
+                        if let microphoneActivity {
+                            MicrophoneActivityView(level: microphoneActivity)
+                                .opacity(showsMicrophoneActivity ? 1 : 0)
+                                .padding(.trailing, 10)
+                        }
+                    }
                 Capsule()
                     .fill(configuration.isOn ? Color.accentColor : Color.primary.opacity(0.14))
                     .frame(width: 36, height: 22)
@@ -204,7 +213,8 @@ struct ContentView: View {
             sectionTitle("Sources")
             Toggle(isOn: Binding(get: { engine.audioEnabled }, set: { _ in changeMicrophone() })) {
                 Label("Microphone", systemImage: "mic")
-            }.toggleStyle(SourceToggleStyle()).disabled(engine.finishing || changingMicrophone)
+            }.toggleStyle(SourceToggleStyle(microphoneActivity: engine.microphoneLevel, showsMicrophoneActivity: engine.audioEnabled))
+                .disabled(engine.finishing || changingMicrophone)
             Text(engine.audioEnabled ? "System default microphone" : "Off · No microphone audio")
                 .font(.caption).foregroundStyle(.secondary)
             Toggle(isOn: Binding(get: { engine.cameraEnabled }, set: { _ in

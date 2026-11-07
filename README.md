@@ -7,6 +7,9 @@ Requires Xcode command-line tools with Swift 5.10 or later (Xcode 16+ recommende
 
 Enable a camera, a screen/window, or both. Enable the microphone to record
 voice. Select the screen resolution cap before enabling screen capture.
+When the microphone is on, a five-bar activity meter responds to input sound even
+before recording. It fades to gray in silence and hides when muted without moving
+the microphone label or switch. It indicates sound level, not speech recognition.
 Choose a destination folder before recording; Recorder remembers it across launches.
 Stop saves an H.264/AAC `recording.mp4` and, when transcription is enabled, generates `recording.srt`
 inside a new `recording_YYYYMMDD_HHMMSS` folder under that destination.

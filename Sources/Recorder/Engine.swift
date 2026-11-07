@@ -43,6 +43,10 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     @Published var cameraEnabled = false
     @Published var screenEnabled = false
     @Published var audioEnabled = false
+    @Published private(set) var microphoneLevel = 0.0
+    // UI generation rejects updates queued by a previous microphone session.
+    private var microphoneGeneration = UUID()
+    private var microphoneSilenceReset: DispatchWorkItem?
     @Published var recording = false
     @Published var finishing = false
     @Published var status = "Choose your sources to get started."
@@ -172,6 +176,8 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     private var useCamera = false
     private var useScreen = false
     private var useAudio = false
+    private var microphoneMeter = MicrophoneLevelMeter()
+    private var meterGeneration = UUID()
     private var screenSize = CGSize(width: 1920, height: 1080)
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
@@ -274,11 +280,17 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
 
     func toggleAudio() async {
         if audioEnabled {
-            queue.sync { useAudio = false; micSession.stopRunning() }
+            microphoneGeneration = UUID()
+            microphoneSilenceReset?.cancel()
+            microphoneLevel = 0
+            queue.sync { useAudio = false; microphoneMeter.reset(); micSession.stopRunning() }
             audioEnabled = false; return
         }
         guard await AVCaptureDevice.requestAccess(for: .audio) else { error = "Allow microphone access in System Settings → Privacy & Security → Microphone."; return }
         do {
+            let generation = UUID()
+            microphoneGeneration = generation
+            microphoneLevel = 0
             try queue.sync {
                 if micSession.inputs.isEmpty {
                     guard let device = AVCaptureDevice.default(for: .audio) else { throw RecorderError.message("No microphone is available.") }
@@ -290,6 +302,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
                     guard micSession.canAddOutput(output) else { throw RecorderError.message("Cannot configure microphone output.") }
                     micSession.addOutput(output)
                 }
+                microphoneMeter.reset(); meterGeneration = generation
                 micSession.startRunning(); useAudio = true
             }
             audioEnabled = true
@@ -399,8 +412,31 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
             cameraImage = CIImage(cvPixelBuffer: buffer)
             previewCount += 1
             if previewCount % 3 == 0, let cameraImage { publishPreview(cameraImage, camera: true) }
-        } else if useAudio, let writer, writer.status == .writing, let audioInput, audioInput.isReadyForMoreMediaData, CMSampleBufferGetPresentationTimeStamp(sampleBuffer) >= startTime {
-            if !audioInput.append(sampleBuffer) { report(writer.error?.localizedDescription ?? "Audio encoding failed.") }
+        } else if output is AVCaptureAudioDataOutput, useAudio {
+            // Meter even when no writer exists; never modify the captured audio.
+            let power = connection.audioChannels.map { Double($0.averagePowerLevel) }.max() ?? -.infinity
+            if let level = microphoneMeter.update(power: power, at: ProcessInfo.processInfo.systemUptime) {
+                publishMicrophoneLevel(level, generation: meterGeneration)
+            }
+            if let writer, writer.status == .writing, let audioInput, audioInput.isReadyForMoreMediaData,
+               CMSampleBufferGetPresentationTimeStamp(sampleBuffer) >= startTime {
+                if !audioInput.append(sampleBuffer) { report(writer.error?.localizedDescription ?? "Audio encoding failed.") }
+            }
+        }
+    }
+
+    private func publishMicrophoneLevel(_ level: Double, generation: UUID) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.audioEnabled, self.microphoneGeneration == generation else { return }
+            self.microphoneLevel = level
+            self.microphoneSilenceReset?.cancel()
+            let reset = DispatchWorkItem { [weak self] in
+                guard let self, self.microphoneGeneration == generation else { return }
+                self.microphoneLevel = 0
+            }
+            self.microphoneSilenceReset = reset
+            // A disconnected/stalled input must not leave a frozen green meter.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: reset)
         }
     }
 

@@ -80,7 +80,8 @@ the webcam resolution picker locks during recording and saving.
 
 ## App icon
 
-The PNG master is `assets/Recorder.png`; the ready-to-use macOS icon is
+The editable vector source is `assets/Recorder.svg`. Its transparent 1024×1024
+PNG export is `assets/Recorder.png`; the ready-to-use macOS icon is
 `assets/Recorder.icns`. `scripts/export-icon.sh` exports standard and Retina
 sizes using native macOS tools. The build script exports and bundles the icon
 before signing the app.

@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import ScreenCaptureKit
 import CoreImage
+import OSLog
 
 enum WebcamResolution: String, CaseIterable, Identifiable {
     case auto, p480, p720
@@ -47,6 +48,11 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     // UI generation rejects updates queued by a previous microphone session.
     private var microphoneGeneration = UUID()
     private var microphoneSilenceReset: DispatchWorkItem?
+    @Published private(set) var starting = false
+    @Published private(set) var restoringSources = false
+    private var previewActive = true
+    private var lifecycleID = UUID()
+    private var startTask: Task<Void, Never>?
     @Published var recording = false
     @Published var finishing = false
     @Published var status = "Choose your sources to get started."
@@ -176,6 +182,13 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     private var useCamera = false
     private var useScreen = false
     private var useAudio = false
+    private var lastAudioArrival: Double?
+    private let mediaLog = Logger(subsystem: "local.recorder.app", category: "capture")
+    private var receivedAudioBuffers = 0
+    private var rejectedAudioBuffers = 0
+    private var reportedAudioStall = false
+    private var appendedAudioBuffers = 0
+    private var expectedAudio = false
     private var microphoneMeter = MicrophoneLevelMeter()
     private var meterGeneration = UUID()
     private var screenSize = CGSize(width: 1920, height: 1080)
@@ -248,16 +261,22 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
         screenEnabled = false; screenPreview = nil
     }
 
-    func toggleCamera() async {
-        if cameraEnabled {
+    func toggleCamera() async { await setCameraEnabled(!cameraEnabled) }
+
+    private func setCameraEnabled(_ enabled: Bool) async {
+        if !enabled {
             queue.sync { cameraSession.stopRunning(); useCamera = false; cameraImage = nil }
             cameraEnabled = false; cameraPreview = nil
             return
         }
+        let requestID = lifecycleID
         guard await AVCaptureDevice.requestAccess(for: .video) else { error = "Allow camera access in System Settings → Privacy & Security → Camera."; return }
+        guard previewActive, requestID == lifecycleID else { return }
         do {
             try queue.sync {
-                if cameraSession.inputs.isEmpty {
+                if cameraSession.inputs.isEmpty || cameraSession.outputs.isEmpty {
+                    cameraSession.inputs.forEach { cameraSession.removeInput($0) }
+                    cameraSession.outputs.forEach { cameraSession.removeOutput($0) }
                     guard let device = AVCaptureDevice.default(for: .video) else { throw RecorderError.message("No camera is available.") }
                     cameraSession.beginConfiguration()
                     defer { cameraSession.commitConfiguration() }
@@ -278,21 +297,27 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
         } catch { self.error = error.localizedDescription }
     }
 
-    func toggleAudio() async {
-        if audioEnabled {
+    func toggleAudio() async { await setAudioEnabled(!audioEnabled) }
+
+    private func setAudioEnabled(_ enabled: Bool) async {
+        if !enabled {
             microphoneGeneration = UUID()
             microphoneSilenceReset?.cancel()
             microphoneLevel = 0
-            queue.sync { useAudio = false; microphoneMeter.reset(); micSession.stopRunning() }
+            queue.sync { useAudio = false; lastAudioArrival = nil; microphoneMeter.reset(); micSession.stopRunning() }
             audioEnabled = false; return
         }
+        let requestID = lifecycleID
         guard await AVCaptureDevice.requestAccess(for: .audio) else { error = "Allow microphone access in System Settings → Privacy & Security → Microphone."; return }
+        guard previewActive, requestID == lifecycleID else { return }
         do {
             let generation = UUID()
             microphoneGeneration = generation
             microphoneLevel = 0
             try queue.sync {
-                if micSession.inputs.isEmpty {
+                if micSession.inputs.isEmpty || micSession.outputs.isEmpty {
+                    micSession.inputs.forEach { micSession.removeInput($0) }
+                    micSession.outputs.forEach { micSession.removeOutput($0) }
                     guard let device = AVCaptureDevice.default(for: .audio) else { throw RecorderError.message("No microphone is available.") }
                     let input = try AVCaptureDeviceInput(device: device)
                     guard micSession.canAddInput(input) else { throw RecorderError.message("Cannot connect to the microphone.") }
@@ -304,12 +329,76 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
                 }
                 microphoneMeter.reset(); meterGeneration = generation
                 micSession.startRunning(); useAudio = true
+                if writer != nil { expectedAudio = true }
             }
             audioEnabled = true
         } catch { self.error = error.localizedDescription }
     }
 
+    // Choices survive suspension, but hardware and queued UI updates do not.
+    func suspendPreview() {
+        guard !recording else { return }
+        previewActive = false
+        lifecycleID = UUID()
+        startTask?.cancel(); startTask = nil; starting = false; restoringSources = false
+        microphoneGeneration = UUID()
+        microphoneSilenceReset?.cancel(); microphoneLevel = 0
+        queue.sync {
+            useCamera = false; useAudio = false
+            cameraSession.stopRunning(); micSession.stopRunning()
+            cameraImage = nil; lastAudioArrival = nil; microphoneMeter.reset()
+        }
+        cameraPreview = nil
+    }
+
+    @MainActor func resumePreview() async {
+        guard !recording else { return }
+        previewActive = true
+        lifecycleID = UUID()
+        let id = lifecycleID
+        restoringSources = true
+        defer { if lifecycleID == id { restoringSources = false } }
+        if cameraEnabled { await setCameraEnabled(true) }
+        guard previewActive, lifecycleID == id else { return }
+        if audioEnabled { await setAudioEnabled(true) }
+    }
+
     func start() {
+        guard !starting, !recording, !finishing, !restoringSources, previewActive else { return }
+        guard !transcriptionEnabled || modelReady else { return }
+        guard let destination, FileManager.default.isWritableFile(atPath: destination.path) else {
+            error = "Choose an available, writable destination folder."; return
+        }
+        guard queue.sync(execute: { (useScreen || useCamera) && (!useScreen || screenImage != nil) && (!useCamera || cameraImage != nil) }) else {
+            error = "Wait for your selected sources to connect before recording."; return
+        }
+        let id = lifecycleID
+        starting = true
+        startTask = Task { @MainActor in
+            defer { if self.lifecycleID == id { self.starting = false; self.startTask = nil } }
+            do {
+                // A silent microphone still delivers buffers. Never infer readiness from volume.
+                let deadline = ProcessInfo.processInfo.systemUptime + 2
+                while self.audioEnabled && !self.queue.sync(execute: {
+                    self.useAudio && self.micSession.isRunning &&
+                    self.lastAudioArrival.map { ProcessInfo.processInfo.systemUptime - $0 < 0.5 } == true
+                }) {
+                    guard ProcessInfo.processInfo.systemUptime < deadline else {
+                        throw RecorderError.message("The microphone is not delivering audio. Turn it off and on or reconnect it before recording.")
+                    }
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                try Task.checkCancellation()
+                try await RecordingStartChime.play()
+                try Task.checkCancellation()
+                guard self.previewActive else { return }
+                self.beginRecording()
+            } catch is CancellationError {
+            } catch { self.error = error.localizedDescription }
+        }
+    }
+
+    private func beginRecording() {
         guard (!transcriptionEnabled || modelReady), !recording, !finishing else { return }
         guard let destination, FileManager.default.isWritableFile(atPath: destination.path) else {
             error = "Choose an available, writable destination folder."; return
@@ -320,6 +409,9 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
             try queue.sync {
                 guard useScreen || useCamera else { throw RecorderError.message("Enable a screen or camera before recording.") }
                 guard !useScreen || screenImage != nil, !useCamera || cameraImage != nil else { throw RecorderError.message("Waiting for the first preview frame. Try again in a moment.") }
+                guard !audioEnabled || (useAudio && micSession.isRunning && lastAudioArrival.map { ProcessInfo.processInfo.systemUptime - $0 < 0.5 } == true) else {
+                    throw RecorderError.message("The microphone stopped delivering audio. Reconnect it before recording.")
+                }
                 let folder = try RecordingOutput.createFolder(in: destination, at: Date())
                 createdFolder = folder
                 let url = folder.appendingPathComponent("recording.mp4")
@@ -342,6 +434,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
                 guard asset.startWriting() else { throw asset.error ?? RecorderError.message("Cannot start MP4 writer.") }
                 startTime = CMClockGetTime(CMClockGetHostTimeClock())
                 asset.startSession(atSourceTime: startTime)
+                appendedAudioBuffers = 0; receivedAudioBuffers = 0; rejectedAudioBuffers = 0; reportedAudioStall = false; expectedAudio = useAudio
                 writer = asset; videoInput = video; audioInput = audio; adaptor = pixels; writingURL = url; frameCount = 0
                 let timer = DispatchSource.makeTimerSource(queue: queue)
                 timer.schedule(deadline: .now(), repeating: 1.0 / 30)
@@ -366,6 +459,11 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     }
 
     private func writeFrame() {
+        if writer != nil, useAudio, !reportedAudioStall,
+           lastAudioArrival.map({ ProcessInfo.processInfo.systemUptime - $0 > 2 }) != false {
+            reportedAudioStall = true
+            report("Microphone audio stopped arriving. Check the microphone connection; video recording is continuing.")
+        }
         guard let writer, writer.status == .writing, let videoInput, videoInput.isReadyForMoreMediaData, let adaptor, let pool = adaptor.pixelBufferPool else { return }
         var buffer: CVPixelBuffer?
         guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer) == kCVReturnSuccess, let buffer else { return }
@@ -390,12 +488,16 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
             self.writeFrame()
             asset.endSession(atSourceTime: CMClockGetTime(CMClockGetHostTimeClock()))
             self.videoInput?.markAsFinished(); self.audioInput?.markAsFinished()
+            self.mediaLog.info("Recording audio: received=\(self.receivedAudioBuffers), appended=\(self.appendedAudioBuffers), rejected=\(self.rejectedAudioBuffers)")
+            let missingAudio = self.expectedAudio && self.appendedAudioBuffers == 0
             let url = self.writingURL
             self.writer = nil; self.videoInput = nil; self.audioInput = nil; self.adaptor = nil
             asset.finishWriting {
                 DispatchQueue.main.async {
                     self.finishing = false
+                    self.suspendPreview()
                     if asset.status == .completed {
+                        if missingAudio { self.error = "Video saved, but no microphone audio was received. Check your microphone before the next recording." }
                         self.lastFile = url
                         if self.lastRecordingNeedsTranscript { self.transcribeLastRecording() }
                         else { self.status = "Video saved." }
@@ -413,14 +515,22 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
             previewCount += 1
             if previewCount % 3 == 0, let cameraImage { publishPreview(cameraImage, camera: true) }
         } else if output is AVCaptureAudioDataOutput, useAudio {
+            lastAudioArrival = ProcessInfo.processInfo.systemUptime
+            reportedAudioStall = false
+            if writer != nil { receivedAudioBuffers += 1 }
             // Meter even when no writer exists; never modify the captured audio.
             let power = connection.audioChannels.map { Double($0.averagePowerLevel) }.max() ?? -.infinity
             if let level = microphoneMeter.update(power: power, at: ProcessInfo.processInfo.systemUptime) {
                 publishMicrophoneLevel(level, generation: meterGeneration)
             }
             if let writer, writer.status == .writing, let audioInput, audioInput.isReadyForMoreMediaData,
-               CMSampleBufferGetPresentationTimeStamp(sampleBuffer) >= startTime {
-                if !audioInput.append(sampleBuffer) { report(writer.error?.localizedDescription ?? "Audio encoding failed.") }
+               let clock = micSession.synchronizationClock {
+                do {
+                    let sample = try RecordingAudioTiming.convert(sampleBuffer, from: clock, to: CMClockGetHostTimeClock())
+                    guard RecordingAudioTiming.isEligible(sample, startingAt: startTime) else { rejectedAudioBuffers += 1; return }
+                    if audioInput.append(sample) { appendedAudioBuffers += 1 }
+                    else { report(writer.error?.localizedDescription ?? "Audio encoding failed.") }
+                } catch { report(error.localizedDescription) }
             }
         }
     }
@@ -452,7 +562,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
         let small = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
         guard let cg = context.createCGImage(small, from: small.extent) else { return }
         let preview = NSImage(cgImage: cg, size: .zero)
-        DispatchQueue.main.async { if camera { if self.cameraEnabled { self.cameraPreview = preview } } else if self.screenEnabled { self.screenPreview = preview } }
+        DispatchQueue.main.async { if camera { if self.cameraEnabled && self.previewActive { self.cameraPreview = preview } } else if self.screenEnabled { self.screenPreview = preview } }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

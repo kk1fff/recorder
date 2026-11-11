@@ -46,6 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { sender.terminate(nil) }
             return .terminateCancel
         }
+        engine.suspendPreview()
         return .terminateNow
     }
 

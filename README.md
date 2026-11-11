@@ -11,6 +11,18 @@ When the microphone is on, a five-bar activity meter responds to input sound eve
 before recording. It fades to gray in silence and hides when muted without moving
 the microphone label or switch. It indicates sound level, not speech recognition.
 Choose a destination folder before recording; Recorder remembers it across launches.
+Start plays a short chime before the recording timeline begins, followed by a
+brief pause to let speaker sound decay. The button shows “Starting…” during this
+period; begin speaking when it changes to “Stop recording.” Microphone samples
+from before the recording starts are discarded. If the enabled microphone is not
+delivering fresh audio, starting fails with an explanation instead of silently
+recording without it.
+
+Camera and microphone capture stop on the saved-recording screen, including
+while transcription runs. New recording restores the previous source choices
+and reconnects the devices. Switching to another app during recording does not
+interrupt capture.
+
 Stop saves an H.264/AAC `recording.mp4` and, when transcription is enabled, generates `recording.srt`
 inside a new `recording_YYYYMMDD_HHMMSS` folder under that destination.
 Folder names use local recording start time; existing folders are never overwritten.
@@ -72,3 +84,13 @@ The PNG master is `assets/Recorder.png`; the ready-to-use macOS icon is
 `assets/Recorder.icns`. `scripts/export-icon.sh` exports standard and Retina
 sizes using native macOS tools. The build script exports and bundles the icon
 before signing the app.
+
+Capture lifecycle checks: make at least three consecutive recordings using New
+recording, with transcription both on and off. Speak distinct phrases in each
+and check the saved audio and synchronization. Confirm camera/mic privacy
+indicators disappear on the detail screen and return on setup. Test View last
+recording and rapid navigation while sources connect, plus quitting during
+Starting. Verify the start chime is absent from recordings using built-in
+speakers and headphones. Test disconnecting/reconnecting the microphone and
+muting/unmuting mid-recording. Capture diagnostics are available in Console
+under subsystem local.recorder.app, category capture.

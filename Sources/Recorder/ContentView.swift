@@ -52,12 +52,12 @@ struct ContentView: View {
     @State private var changingCamera = false
     @State private var showDetail = false
 
-    private var locked: Bool { engine.recording || engine.finishing }
+    private var locked: Bool { engine.recording || engine.finishing || engine.starting || engine.restoringSources }
     private var showingModelLaunch: Bool {
         engine.transcriptionEnabled && !engine.modelReady && !showDetail && !engine.recording && !engine.finishing
     }
     private var canRecord: Bool {
-        !engine.recording && !engine.finishing && !changingCamera && !changingMicrophone
+        !locked && !changingCamera && !changingMicrophone
             && engine.destination != nil && (engine.screenEnabled || engine.cameraEnabled)
             && (!engine.screenEnabled || engine.screenPreview != nil)
             && (!engine.cameraEnabled || engine.cameraPreview != nil)
@@ -65,6 +65,8 @@ struct ContentView: View {
     }
 
     private var setupStatus: String {
+        if engine.starting { return "Starting…" }
+        if engine.restoringSources { return "Connecting sources…" }
         if engine.transcribing { return "Transcribing…" }
         if engine.finishing { return "Saving recording…" }
         if changingCamera || changingMicrophone { return "Connecting sources…" }
@@ -92,6 +94,10 @@ struct ContentView: View {
             if showingModelLaunch { modelLaunchOverlay }
         }
         .background(WindowCloseGuard())
+        .onChange(of: showDetail) { _, detail in
+            if detail { engine.suspendPreview() }
+            else { Task { await engine.resumePreview() } }
+        }
         .onChange(of: engine.lastFile) { _, file in if file != nil { showDetail = true } }
         .onChange(of: engine.recording) { _, active in
             if active { startedAt = Date() }
@@ -160,7 +166,7 @@ struct ContentView: View {
                 Button {
                     if engine.recording { engine.stop() } else { engine.start() }
                 } label: {
-                    Label(engine.recording ? "Stop recording" : engine.finishing ? "Saving recording…" : "Start recording",
+                    Label(engine.recording ? "Stop recording" : engine.finishing ? "Saving recording…" : engine.starting ? "Starting…" : "Start recording",
                           systemImage: engine.recording ? "stop.fill" : "circle.fill")
                         .font(.system(size: 13, weight: .medium)).padding(.horizontal, 14).padding(.vertical, 7)
                 }
@@ -214,7 +220,7 @@ struct ContentView: View {
             Toggle(isOn: Binding(get: { engine.audioEnabled }, set: { _ in changeMicrophone() })) {
                 Label("Microphone", systemImage: "mic")
             }.toggleStyle(SourceToggleStyle(microphoneActivity: engine.microphoneLevel, showsMicrophoneActivity: engine.audioEnabled))
-                .disabled(engine.finishing || changingMicrophone)
+                .disabled(engine.finishing || engine.starting || engine.restoringSources || changingMicrophone)
             Text(engine.audioEnabled ? "System default microphone" : "Off · No microphone audio")
                 .font(.caption).foregroundStyle(.secondary)
             Toggle(isOn: Binding(get: { engine.cameraEnabled }, set: { _ in

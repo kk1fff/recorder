@@ -1,5 +1,6 @@
 import XCTest
 import AVFoundation
+import ScreenCaptureKit
 @testable import Recorder
 
 final class CaptureLifecycleTests: XCTestCase {
@@ -9,12 +10,16 @@ final class CaptureLifecycleTests: XCTestCase {
         let engine = CaptureEngine(preferences: preferences)
         engine.cameraEnabled = true
         engine.audioEnabled = true
+        engine.screenEnabled = true
+        engine.screenPreview = NSImage(size: NSSize(width: 2, height: 2))
         engine.cameraPreview = NSImage(size: NSSize(width: 2, height: 2))
         engine.suspendPreview()
         engine.suspendPreview()
         XCTAssertTrue(engine.cameraEnabled)
         XCTAssertTrue(engine.audioEnabled)
         XCTAssertNil(engine.cameraPreview)
+        XCTAssertTrue(engine.screenEnabled)
+        XCTAssertNil(engine.screenPreview)
         XCTAssertEqual(engine.microphoneLevel, 0)
         engine.start()
         XCTAssertFalse(engine.starting)
@@ -28,6 +33,52 @@ final class CaptureLifecycleTests: XCTestCase {
         engine.suspendPreview()
         XCTAssertTrue(engine.recording)
         XCTAssertNotNil(engine.cameraPreview)
+    }
+
+    @MainActor func testRetiredScreenFailureDoesNotInterruptRecording() async {
+        let engine = CaptureEngine(preferences: UserDefaults(suiteName: UUID().uuidString)!)
+        let retired = SCStream(filter: SCContentFilter(), configuration: SCStreamConfiguration(), delegate: nil)
+        engine.recording = true
+        engine.screenEnabled = true
+        engine.screenPreview = NSImage(size: NSSize(width: 2, height: 2))
+        engine.stream(retired, didStopWithError: NSError(domain: SCStreamErrorDomain, code: -3808))
+        // Drain the main queue where the delegate handles failures.
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        XCTAssertTrue(engine.recording)
+        XCTAssertTrue(engine.screenEnabled)
+        XCTAssertNotNil(engine.screenPreview)
+        XCTAssertNil(engine.error)
+    }
+
+    @MainActor func testPendingScreenSelectionBlocksStartAndSuspensionInvalidatesIt() async {
+        let preferences = UserDefaults(suiteName: UUID().uuidString)!
+        preferences.set(false, forKey: "transcriptionEnabled")
+        let entered = expectation(description: "Enumerating screen sources")
+        var pending: CheckedContinuation<[CaptureSource], Error>?
+        let engine = CaptureEngine(preferences: preferences, screenSourceProvider: {
+            try await withCheckedThrowingContinuation { continuation in
+                pending = continuation
+                entered.fulfill()
+            }
+        })
+        let source = CaptureSource(id: "d1", name: "Display", detail: "", filter: SCContentFilter(), size: CGSize(width: 1920, height: 1080))
+        let selection = Task { await engine.select(source) }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertTrue(engine.selectingScreen)
+        engine.start()
+        XCTAssertFalse(engine.starting)
+        XCTAssertFalse(engine.recording)
+        // Without the busy guard, start reaches destination validation and reports an error.
+        XCTAssertNil(engine.error)
+        engine.suspendPreview()
+        XCTAssertFalse(engine.selectingScreen)
+        pending?.resume(returning: [source])
+        await selection.value
+        XCTAssertFalse(engine.screenEnabled)
+        XCTAssertFalse(engine.selectingScreen)
+        XCTAssertNil(engine.error)
     }
 
     func testChimeIsDecodableAndShort() throws {

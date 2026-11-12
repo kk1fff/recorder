@@ -52,7 +52,7 @@ struct ContentView: View {
     @State private var changingCamera = false
     @State private var showDetail = false
 
-    private var locked: Bool { engine.recording || engine.finishing || engine.starting || engine.restoringSources }
+    private var locked: Bool { engine.recording || engine.finishing || engine.starting || engine.restoringSources || engine.selectingScreen }
     private var showingModelLaunch: Bool {
         engine.transcriptionEnabled && !engine.modelReady && !showDetail && !engine.recording && !engine.finishing
     }
@@ -66,7 +66,7 @@ struct ContentView: View {
 
     private var setupStatus: String {
         if engine.starting { return "Starting…" }
-        if engine.restoringSources { return "Connecting sources…" }
+        if engine.restoringSources || engine.selectingScreen { return "Connecting sources…" }
         if engine.transcribing { return "Transcribing…" }
         if engine.finishing { return "Saving recording…" }
         if changingCamera || changingMicrophone { return "Connecting sources…" }

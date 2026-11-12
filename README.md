@@ -18,9 +18,10 @@ from before the recording starts are discarded. If the enabled microphone is not
 delivering fresh audio, starting fails with an explanation instead of silently
 recording without it.
 
-Camera and microphone capture stop on the saved-recording screen, including
+Screen, camera, and microphone capture stop on the saved-recording screen, including
 while transcription runs. New recording restores the previous source choices
-and reconnects the devices. Switching to another app during recording does not
+and reconnects the devices. Screen sources are refreshed before reconnecting; if
+the selected window closed or display disconnected, choose a source again. Switching to another app during recording does not
 interrupt capture.
 
 Stop saves an H.264/AAC `recording.mp4` and, when transcription is enabled, generates `recording.srt`
@@ -95,3 +96,9 @@ Starting. Verify the start chime is absent from recordings using built-in
 speakers and headphones. Test disconnecting/reconnecting the microphone and
 muting/unmuting mid-recording. Capture diagnostics are available in Console
 under subsystem local.recorder.app, category capture.
+
+Screen lifecycle checks: after saving, confirm the screen-sharing indicator stops.
+Return with New recording and verify the same source reconnects. Close the selected
+window or disconnect the display while on the detail screen, then return to setup
+and verify the recovery message. Rapidly switch sources and navigate between setup
+and detail; callbacks from old streams must not clear the new preview or stop a take.

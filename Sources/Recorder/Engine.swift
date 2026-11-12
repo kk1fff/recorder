@@ -177,6 +177,9 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     private let cameraSession = AVCaptureSession()
     private let micSession = AVCaptureSession()
     private var stream: SCStream?
+    private var mediaStream: SCStream? // Access only on the media queue.
+    private var screenRequestID = UUID()
+    private var selectedSourceID: String?
     private var cameraImage: CIImage?
     private var screenImage: CIImage?
     private var useCamera = false
@@ -207,35 +210,63 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
 
     private func report(_ message: String) { DispatchQueue.main.async { self.error = message } }
 
-    func loadSources() async {
+    @MainActor private func availableSources() async throws -> [CaptureSource] {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        return Self.captureSources(from: content)
+    }
+
+    private static func captureSources(from content: SCShareableContent) -> [CaptureSource] {
+        var result: [CaptureSource] = []
+        for display in content.displays {
+            let own = content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
+            result.append(CaptureSource(id: "d\(display.displayID)", name: "Display \(result.count + 1)", detail: "\(display.width) × \(display.height)", filter: SCContentFilter(display: display, excludingApplications: own, exceptingWindows: []), size: CGSize(width: display.width, height: display.height)))
+        }
+        for window in content.windows where window.frame.width > 100 && window.frame.height > 80 && window.owningApplication?.processID != ProcessInfo.processInfo.processIdentifier {
+            guard let app = window.owningApplication, let title = window.title, !title.isEmpty else { continue }
+            result.append(CaptureSource(id: "w\(window.windowID)", name: title, detail: app.applicationName, filter: SCContentFilter(desktopIndependentWindow: window), size: window.frame.size))
+        }
+        return result
+    }
+
+    @MainActor func loadSources() async {
         loadingSources = true
         defer { loadingSources = false }
         do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            var result: [CaptureSource] = []
-            for display in content.displays {
-                let own = content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
-                result.append(CaptureSource(id: "d\(display.displayID)", name: "Display \(result.count + 1)", detail: "\(display.width) × \(display.height)", filter: SCContentFilter(display: display, excludingApplications: own, exceptingWindows: []), size: CGSize(width: display.width, height: display.height)))
-            }
-            for window in content.windows where window.frame.width > 100 && window.frame.height > 80 && window.owningApplication?.processID != ProcessInfo.processInfo.processIdentifier {
-                guard let app = window.owningApplication, let title = window.title, !title.isEmpty else { continue }
-                result.append(CaptureSource(id: "w\(window.windowID)", name: title, detail: app.applicationName, filter: SCContentFilter(desktopIndependentWindow: window), size: window.frame.size))
-            }
+            let result = try await availableSources()
             sources = result
             for index in result.indices {
                 let config = SCStreamConfiguration()
                 config.width = 360; config.height = 220
                 config.showsCursor = true
                 if let image = try? await SCScreenshotManager.captureImage(contentFilter: result[index].filter, configuration: config) {
-                    sources[index].thumbnail = NSImage(cgImage: image, size: .zero)
+                    if let current = sources.firstIndex(where: { $0.id == result[index].id }) {
+                        sources[current].thumbnail = NSImage(cgImage: image, size: .zero)
+                    }
                 }
             }
         } catch { self.error = "Screen access failed: \(error.localizedDescription). Allow Recorder in System Settings → Privacy & Security → Screen & System Audio Recording." }
     }
 
-    func select(_ source: CaptureSource) async {
+    @MainActor func select(_ source: CaptureSource) async {
+        await selectSource(id: source.id)
+    }
+
+    @MainActor private func selectSource(id: String) async {
+        guard previewActive, !recording, !starting, !finishing else { return }
+        screenRequestID = UUID()
+        let requestID = screenRequestID
+        let previous = detachScreenStream()
+        selectedSourceID = id
+        screenEnabled = false
         do {
-            if let stream { try await stream.stopCapture() }
+            if let previous { try? await previous.stopCapture() }
+            guard requestID == screenRequestID, previewActive else { return }
+            // Picker filters may refer to a window that closed or a disconnected display.
+            let currentSources = try await availableSources()
+            guard requestID == screenRequestID, previewActive else { return }
+            guard let source = currentSources.first(where: { $0.id == id }) else {
+                throw RecorderError.message("The selected screen or window is no longer available. Reconnect the display or reopen the window, then choose it again.")
+            }
             let scale = min(1, min(CGFloat(resolution) / source.size.width, CGFloat(resolution * 9 / 16) / source.size.height))
             let size = CGSize(width: max(2, Int(source.size.width * scale) / 2 * 2), height: max(2, Int(source.size.height * scale) / 2 * 2))
             let config = SCStreamConfiguration()
@@ -245,20 +276,45 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
             config.pixelFormat = kCVPixelFormatType_32BGRA
             let next = SCStream(filter: source.filter, configuration: config, delegate: self)
             try next.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
-            queue.sync { self.screenImage = nil; self.screenSize = size; self.useScreen = true }
+            queue.sync { self.screenImage = nil; self.screenSize = size; self.useScreen = true; self.mediaStream = next }
             stream = next
             try await next.startCapture()
+            guard requestID == screenRequestID, previewActive, stream === next else {
+                try? await next.stopCapture()
+                return
+            }
+            selectedSourceID = id
             selectedScreenSize = size
             screenEnabled = true; sourceName = source.name
             status = "Screen selected."
-        } catch { queue.sync { self.useScreen = false }; screenEnabled = false; self.error = error.localizedDescription }
+        } catch {
+            guard requestID == screenRequestID else { return }
+            let failed = detachScreenStream()
+            if let failed { try? await failed.stopCapture() }
+            guard requestID == screenRequestID else { return }
+            screenEnabled = false
+            selectedSourceID = nil
+            sourceName = "No screen selected"
+            self.error = "Could not start screen capture: \(error.localizedDescription)"
+        }
     }
 
-    func disableScreen() async {
-        do { try await stream?.stopCapture() } catch { self.error = error.localizedDescription }
+    // Invalidate callbacks before asking ScreenCaptureKit to stop asynchronously.
+    @discardableResult private func detachScreenStream() -> SCStream? {
+        let previous = stream
         stream = nil
-        queue.sync { self.useScreen = false; self.screenImage = nil }
-        screenEnabled = false; screenPreview = nil
+        queue.sync { self.mediaStream = nil; self.useScreen = false; self.screenImage = nil }
+        screenPreview = nil
+        return previous
+    }
+
+    @MainActor func disableScreen() async {
+        screenRequestID = UUID()
+        let previous = detachScreenStream()
+        selectedSourceID = nil
+        screenEnabled = false
+        sourceName = "No screen selected"
+        if let previous { try? await previous.stopCapture() }
     }
 
     func toggleCamera() async { await setCameraEnabled(!cameraEnabled) }
@@ -339,6 +395,10 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     func suspendPreview() {
         guard !recording else { return }
         previewActive = false
+        screenRequestID = UUID()
+        if let previous = detachScreenStream() {
+            Task { try? await previous.stopCapture() }
+        }
         lifecycleID = UUID()
         startTask?.cancel(); startTask = nil; starting = false; restoringSources = false
         microphoneGeneration = UUID()
@@ -361,6 +421,8 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
         if cameraEnabled { await setCameraEnabled(true) }
         guard previewActive, lifecycleID == id else { return }
         if audioEnabled { await setAudioEnabled(true) }
+        guard previewActive, lifecycleID == id else { return }
+        if let selectedSourceID { await selectSource(id: selectedSourceID) }
     }
 
     func start() {
@@ -551,24 +613,34 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sampleBuffer.isValid, let buffer = CMSampleBufferGetImageBuffer(sampleBuffer), useScreen else { return }
+        guard mediaStream === stream, type == .screen, sampleBuffer.isValid, let buffer = CMSampleBufferGetImageBuffer(sampleBuffer), useScreen else { return }
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]], let raw = attachments.first?[.status] as? Int, raw != SCFrameStatus.complete.rawValue { return }
         screenImage = CIImage(cvPixelBuffer: buffer)
-        if let screenImage { publishPreview(screenImage, camera: false) }
+        if let screenImage { publishPreview(screenImage, camera: false, screenStream: stream) }
     }
 
-    private func publishPreview(_ image: CIImage, camera: Bool) {
+    private func publishPreview(_ image: CIImage, camera: Bool, screenStream: SCStream? = nil) {
         let scale = min(1, 640 / image.extent.width)
         let small = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
         guard let cg = context.createCGImage(small, from: small.extent) else { return }
         let preview = NSImage(cgImage: cg, size: .zero)
-        DispatchQueue.main.async { if camera { if self.cameraEnabled && self.previewActive { self.cameraPreview = preview } } else if self.screenEnabled { self.screenPreview = preview } }
+        DispatchQueue.main.async { if camera { if self.cameraEnabled && self.previewActive { self.cameraPreview = preview } } else if self.screenEnabled && self.previewActive && self.stream === screenStream { self.screenPreview = preview } }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        report("Screen capture stopped: \(error.localizedDescription)")
-        DispatchQueue.main.async { if self.recording { self.stop() }; self.screenEnabled = false }
-        queue.async { self.useScreen = false; self.screenImage = nil }
+        let failure = error as NSError
+        mediaLog.error("Screen stream stopped: domain=\(failure.domain, privacy: .public), code=\(failure.code), description=\(failure.localizedDescription, privacy: .public)")
+        DispatchQueue.main.async {
+            guard self.stream === stream else { return }
+            self.screenRequestID = UUID()
+            // Finalize an active recording instead of continuing with frozen frames.
+            if self.recording { self.stop() }
+            self.detachScreenStream()
+            self.screenEnabled = false
+            self.selectedSourceID = nil
+            self.sourceName = "No screen selected"
+            self.error = "Screen capture stopped: \(error.localizedDescription). The selected display or window may have become unavailable. Choose the screen or window again to reconnect."
+        }
     }
 }
 

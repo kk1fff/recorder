@@ -1,5 +1,6 @@
 import XCTest
 import AVFoundation
+import ScreenCaptureKit
 @testable import Recorder
 
 final class CaptureLifecycleTests: XCTestCase {
@@ -9,12 +10,16 @@ final class CaptureLifecycleTests: XCTestCase {
         let engine = CaptureEngine(preferences: preferences)
         engine.cameraEnabled = true
         engine.audioEnabled = true
+        engine.screenEnabled = true
+        engine.screenPreview = NSImage(size: NSSize(width: 2, height: 2))
         engine.cameraPreview = NSImage(size: NSSize(width: 2, height: 2))
         engine.suspendPreview()
         engine.suspendPreview()
         XCTAssertTrue(engine.cameraEnabled)
         XCTAssertTrue(engine.audioEnabled)
         XCTAssertNil(engine.cameraPreview)
+        XCTAssertTrue(engine.screenEnabled)
+        XCTAssertNil(engine.screenPreview)
         XCTAssertEqual(engine.microphoneLevel, 0)
         engine.start()
         XCTAssertFalse(engine.starting)
@@ -28,6 +33,23 @@ final class CaptureLifecycleTests: XCTestCase {
         engine.suspendPreview()
         XCTAssertTrue(engine.recording)
         XCTAssertNotNil(engine.cameraPreview)
+    }
+
+    @MainActor func testRetiredScreenFailureDoesNotInterruptRecording() async {
+        let engine = CaptureEngine(preferences: UserDefaults(suiteName: UUID().uuidString)!)
+        let retired = SCStream(filter: SCContentFilter(), configuration: SCStreamConfiguration(), delegate: nil)
+        engine.recording = true
+        engine.screenEnabled = true
+        engine.screenPreview = NSImage(size: NSSize(width: 2, height: 2))
+        engine.stream(retired, didStopWithError: NSError(domain: SCStreamErrorDomain, code: -3808))
+        // Drain the main queue where the delegate handles failures.
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        XCTAssertTrue(engine.recording)
+        XCTAssertTrue(engine.screenEnabled)
+        XCTAssertNotNil(engine.screenPreview)
+        XCTAssertNil(engine.error)
     }
 
     func testChimeIsDecodableAndShort() throws {

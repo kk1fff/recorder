@@ -50,6 +50,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     private var microphoneSilenceReset: DispatchWorkItem?
     @Published private(set) var starting = false
     @Published private(set) var restoringSources = false
+    @Published private(set) var selectingScreen = false
     private var previewActive = true
     private var lifecycleID = UUID()
     private var startTask: Task<Void, Never>?
@@ -84,12 +85,14 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     private var transcriptionID = UUID()
     private var destinationScoped = false
     private let preferences: UserDefaults
+    private let screenSourceProvider: (@MainActor () async throws -> [CaptureSource])?
 
     override convenience init() {
         self.init(preferences: .standard)
     }
 
-    init(preferences: UserDefaults) {
+    init(preferences: UserDefaults, screenSourceProvider: (@MainActor () async throws -> [CaptureSource])? = nil) {
+        self.screenSourceProvider = screenSourceProvider
         self.preferences = preferences
         self.transcriptionEnabled = preferences.object(forKey: "transcriptionEnabled") as? Bool ?? true
         super.init()
@@ -211,6 +214,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     private func report(_ message: String) { DispatchQueue.main.async { self.error = message } }
 
     @MainActor private func availableSources() async throws -> [CaptureSource] {
+        if let screenSourceProvider { return try await screenSourceProvider() }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         return Self.captureSources(from: content)
     }
@@ -255,6 +259,8 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
         guard previewActive, !recording, !starting, !finishing else { return }
         screenRequestID = UUID()
         let requestID = screenRequestID
+        selectingScreen = true
+        defer { if screenRequestID == requestID { selectingScreen = false } }
         let previous = detachScreenStream()
         selectedSourceID = id
         screenEnabled = false
@@ -310,6 +316,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
 
     @MainActor func disableScreen() async {
         screenRequestID = UUID()
+        selectingScreen = false
         let previous = detachScreenStream()
         selectedSourceID = nil
         screenEnabled = false
@@ -396,6 +403,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
         guard !recording else { return }
         previewActive = false
         screenRequestID = UUID()
+        selectingScreen = false
         if let previous = detachScreenStream() {
             Task { try? await previous.stopCapture() }
         }
@@ -426,7 +434,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
     }
 
     func start() {
-        guard !starting, !recording, !finishing, !restoringSources, previewActive else { return }
+        guard !starting, !recording, !finishing, !restoringSources, !selectingScreen, previewActive else { return }
         guard !transcriptionEnabled || modelReady else { return }
         guard let destination, FileManager.default.isWritableFile(atPath: destination.path) else {
             error = "Choose an available, writable destination folder."; return
@@ -633,6 +641,7 @@ final class CaptureEngine: NSObject, ObservableObject, SCStreamOutput, SCStreamD
         DispatchQueue.main.async {
             guard self.stream === stream else { return }
             self.screenRequestID = UUID()
+            self.selectingScreen = false
             // Finalize an active recording instead of continuing with frozen frames.
             if self.recording { self.stop() }
             self.detachScreenStream()

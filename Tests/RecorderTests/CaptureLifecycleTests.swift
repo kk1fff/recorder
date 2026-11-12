@@ -52,6 +52,35 @@ final class CaptureLifecycleTests: XCTestCase {
         XCTAssertNil(engine.error)
     }
 
+    @MainActor func testPendingScreenSelectionBlocksStartAndSuspensionInvalidatesIt() async {
+        let preferences = UserDefaults(suiteName: UUID().uuidString)!
+        preferences.set(false, forKey: "transcriptionEnabled")
+        let entered = expectation(description: "Enumerating screen sources")
+        var pending: CheckedContinuation<[CaptureSource], Error>?
+        let engine = CaptureEngine(preferences: preferences, screenSourceProvider: {
+            try await withCheckedThrowingContinuation { continuation in
+                pending = continuation
+                entered.fulfill()
+            }
+        })
+        let source = CaptureSource(id: "d1", name: "Display", detail: "", filter: SCContentFilter(), size: CGSize(width: 1920, height: 1080))
+        let selection = Task { await engine.select(source) }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertTrue(engine.selectingScreen)
+        engine.start()
+        XCTAssertFalse(engine.starting)
+        XCTAssertFalse(engine.recording)
+        // Without the busy guard, start reaches destination validation and reports an error.
+        XCTAssertNil(engine.error)
+        engine.suspendPreview()
+        XCTAssertFalse(engine.selectingScreen)
+        pending?.resume(returning: [source])
+        await selection.value
+        XCTAssertFalse(engine.screenEnabled)
+        XCTAssertFalse(engine.selectingScreen)
+        XCTAssertNil(engine.error)
+    }
+
     func testChimeIsDecodableAndShort() throws {
         let player = try AVAudioPlayer(data: RecordingStartChime.waveData())
         XCTAssertEqual(player.duration, 0.25, accuracy: 0.001)
